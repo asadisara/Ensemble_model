@@ -1,0 +1,192 @@
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVR
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import numpy as np
+import shap  # Import the SHAP library
+import matplotlib.pyplot as plt  # Import matplotlib for plotting
+
+# Step 1: Load and Preprocess the Data
+
+data = pd.read_csv('data.csv')
+
+# Convert 'Date' column to datetime format
+data['Date'] = pd.to_datetime(data['Date'])
+
+# Set 'Date' column as index
+data.set_index('Date', inplace=True)
+
+# Split data into training and testing sets
+train_data = data['1990-01-01':'2005-12-31']  # Note the changed start date
+test_data = data['2006-01-01':'2020-09-28']
+
+# Extract features (precipitation and Q(t-1)) and target (observed flow)
+X_train = train_data[['SVR','FFNN','LSTM', 'SWAT']].values
+y_train = train_data['ObservedQ(t)'].values
+X_test = test_data[['SVR','FFNN','LSTM', 'SWAT']].values
+y_test = test_data['ObservedQ(t)'].values
+
+# Step 2: Train the SVR Model
+svr = SVR(kernel='rbf', C=20, epsilon=0.1)  # Adjust hyperparameters as needed
+svr.fit(X_train, y_train)
+
+# Step 3: Predict using the Trained Model
+y_pred_train = svr.predict(X_train)
+y_pred_test = svr.predict(X_test)
+
+# Calculate metrics for the entire train and test periods
+train_metrics = {
+    'NSE': 1 - (sum((y_train - y_pred_train)**2) / sum((y_train - y_train.mean())**2)),
+    'RMSE': np.sqrt(mean_squared_error(y_train, y_pred_train)),
+    'MAE': mean_absolute_error(y_train, y_pred_train),
+    'PBIAS': 100 * sum(y_pred_train - y_train) / sum(y_train)
+}
+
+test_metrics = {
+    'NSE': 1 - (sum((y_test - y_pred_test)**2) / sum((y_test - y_test.mean())**2)),
+    'RMSE': np.sqrt(mean_squared_error(y_test, y_pred_test)),
+    'MAE': mean_absolute_error(y_test, y_pred_test),
+    'PBIAS': 100 * sum(y_pred_test - y_test) / sum(y_test)
+}
+
+# Create DataFrames for train and test metrics
+train_metrics_df = pd.DataFrame(train_metrics, index=['Train'])
+test_metrics_df = pd.DataFrame(test_metrics, index=['Test'])
+
+# Save train and test metrics to the same Excel file with separate sheets
+with pd.ExcelWriter('train_test_metrics_svr.xlsx') as writer:
+    train_metrics_df.to_excel(writer, sheet_name='Train')
+    test_metrics_df.to_excel(writer, sheet_name='Test')
+
+# Save daily simulated data for both train and test periods
+simulated_train_df = pd.DataFrame({'Date': train_data.index, 'Simulated_Flow': y_pred_train})
+simulated_test_df = pd.DataFrame({'Date': test_data.index, 'Simulated_Flow': y_pred_test})
+
+simulated_train_df.to_excel('daily_simulated_data_train_svr.xlsx', index=False)
+simulated_test_df.to_excel('daily_simulated_data_test_svr.xlsx', index=False)
+
+# Aggregate daily values to monthly values
+monthly_observed_train = train_data['ObservedQ(t)'].resample('M').mean()
+monthly_observed_test = test_data['ObservedQ(t)'].resample('M').mean()
+
+monthly_simulated_train = pd.Series(y_pred_train, index=train_data.index).resample('M').mean()
+monthly_simulated_test = pd.Series(y_pred_test, index=test_data.index).resample('M').mean()
+
+# Calculate monthly metrics
+def calculate_monthly_metrics(observed, simulated):
+    metrics = {
+        'NSE': 1 - (sum((observed - simulated)**2) / sum((observed - observed.mean())**2)),
+        'RMSE': np.sqrt(mean_squared_error(observed, simulated)),
+        'MAE': mean_absolute_error(observed, simulated),
+        'PBIAS': 100 * sum(simulated - observed) / sum(observed)
+    }
+
+    return metrics
+
+# Calculate metrics for train and test periods
+metrics_train = calculate_monthly_metrics(monthly_observed_train, monthly_simulated_train)
+metrics_test = calculate_monthly_metrics(monthly_observed_test, monthly_simulated_test)
+
+# Save monthly values for observed and simulated flows
+monthly_observed_train.to_excel('monthly_values_observed_train.xlsx', index=True)
+monthly_simulated_train.to_excel('monthly_values_simulated_train.xlsx', index=True)
+monthly_observed_test.to_excel('monthly_values_observed_test.xlsx', index=True)
+monthly_simulated_test.to_excel('monthly_values_simulated_test.xlsx', index=True)
+
+# Save monthly metrics
+monthly_metrics_df = pd.DataFrame({'Train': metrics_train, 'Test': metrics_test})
+monthly_metrics_df.to_excel('monthly_metrics_aggregated.xlsx')
+
+# Print the evaluation metrics
+print("Daily metrics and simulated data saved in Excel files for both train and test periods.")
+print("Monthly values and metrics saved.")
+
+# Define a wrapper function for the SVR predict method
+def svr_predict(data):
+    return svr.predict(data)
+
+# Step 4: SHAP Analysis
+# Use a subset of the training data as background data
+background_data = shap.sample(X_train, 100)  # For example, use 100 samples
+
+# Create an Explainer for the SVR model
+explainer = shap.KernelExplainer(svr.predict, background_data)
+#explainer = shap.KernelExplainer(svr.predict, X_train)
+
+# Generate SHAP values
+shap_values = explainer.shap_values(X_train)
+
+# Define your feature names
+feature_names = ['SVR', 'FFNN', 'LSTM', 'SWAT+']
+
+# Flatten the SHAP values and X_train data
+shap_values_flattened = np.array(shap_values).reshape(shap_values.shape[0], -1)
+X_train_flattened = X_train.reshape(X_train.shape[0], -1)
+
+# Generate the SHAP summary plot for your regression model
+shap.summary_plot(shap_values_flattened, X_train_flattened, feature_names=feature_names)
+
+
+# Calculate the mean absolute SHAP values for each feature
+mean_shap_values = np.abs(shap_values_flattened).mean(axis=0)
+# Calculate the standard deviation of the SHAP values for each feature
+std_shap_values = np.abs(shap_values_flattened).std(axis=0)
+
+# Sort the features by mean importance
+sorted_indices = np.argsort(mean_shap_values)[::-1]
+sorted_feature_names = np.array(feature_names)[sorted_indices]
+sorted_mean_shap_values = mean_shap_values[sorted_indices]
+sorted_std_shap_values = std_shap_values[sorted_indices]
+
+# Convert mean SHAP values to percentages
+total = sorted_mean_shap_values.sum()
+sorted_mean_shap_values_percent = 100 * sorted_mean_shap_values / total
+
+# Create the bar plot with error bars
+plt.figure(figsize=(10, 6))
+bars = plt.barh(range(len(sorted_feature_names)), sorted_mean_shap_values_percent, color=(0.561, 0.667, 0.863), capsize=3)
+plt.errorbar(sorted_mean_shap_values_percent, range(len(sorted_feature_names)), xerr=sorted_std_shap_values, fmt='none', ecolor='black', elinewidth=1, capthick=1, capsize=5)
+plt.xlabel('Mean Absolute SHAP Value (Importance %)', fontsize=16)
+# Add the importance percentage next to each bar, shifted to the right for clarity, and in dark red color
+for bar in bars:
+    plt.text(bar.get_width() + max(sorted_std_shap_values) + 0.5, bar.get_y() + bar.get_height()/2, f'{bar.get_width():.2f}%', va='center', color=(1,0,0.25), fontsize=14)
+
+# Adjust the starting position of the horizontal axis
+plt.xlim(left=-2, right=max(sorted_mean_shap_values_percent) + max(sorted_std_shap_values) + 4)
+
+plt.yticks(range(len(sorted_feature_names)), sorted_feature_names, fontsize=16)
+plt.xticks(fontsize=14) 
+plt.xlabel('Mean Absolute SHAP Value (Importance %)', fontsize=16)
+plt.title('Global Feature Importance_station 3001', fontsize=20, loc='left')
+plt.gca().invert_yaxis()  # To display the highest importance at the top
+plt.tight_layout()  # Adjust the layout to fit all elements
+plt.savefig('GlobalFeatureImp_station3001.png', dpi=300)  # Save the first figure with high resolution
+plt.show()
+
+# Plot SHAP dependency plots with trendline and R² for each feature
+for i, feature in enumerate(feature_names):
+    plt.figure(figsize=(8, 4))
+    plt.yticks(fontsize=14)
+    plt.xticks(fontsize=14)
+    plt.xlabel(f'{feature} Value', fontsize=16)  # Adjust font size
+    plt.ylabel('SHAP Value', fontsize=16)  # Adjust font size
+    plt.title(f'SHAP Dependence Plot for {feature}_station 3001', fontsize=20, loc='left')
+    plt.scatter(X_train[:, i], shap_values[:, i], c='blue', alpha=0.5)
+
+    # Fit a trendline to the data
+    z = np.polyfit(X_train[:, i], shap_values[:, i], 1)
+    p = np.poly1d(z)
+
+    # Plot the trendline
+    plt.plot(X_train[:, i], p(X_train[:, i]), 'r--')
+
+    # Calculate and print R² value
+    r2 = r2_score(shap_values[:, i], p(X_train[:, i]))
+    plt.text(0.05, 0.92, f'R²: {r2:.3f}', transform=plt.gca().transAxes, fontsize=16)
+
+    plt.xlabel(f'{feature} Value')
+    plt.ylabel('SHAP Value')
+    plt.savefig(f'feature_{i}_{feature}_high_res_station3001.png', dpi=300)
+    plt.show()
+    
